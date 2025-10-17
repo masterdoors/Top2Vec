@@ -477,6 +477,7 @@ class Top2Vec:
                  hdbscan_args=None,
                  gpu_hdbscan=False,
                  index_topics=False,
+                 phrase_model_cls=Phrases,
                  verbose=True
                  ):
 
@@ -495,6 +496,8 @@ class Top2Vec:
             raise ValueError("Documents need to be a list of strings")
         if not all((isinstance(doc, str) or isinstance(doc, np.str_)) for doc in documents):
             raise ValueError("Documents need to be a list of strings")
+
+        self.keep_documents = keep_documents
         if keep_documents:
             self.documents = np.array(documents, dtype="object")
             self.num_documents = len(documents)
@@ -633,7 +636,7 @@ class Top2Vec:
                     ngram_vocab_args['sentences'] = tokenized_corpus
                     ngram_vocab_args['delimiter'] = ' '
 
-                phrase_model = Phrases(**ngram_vocab_args)
+                phrase_model = phrase_model_cls(**ngram_vocab_args)
                 phrase_results = phrase_model.find_phrases(tokenized_corpus)
                 phrases = list(phrase_results.keys())
 
@@ -819,6 +822,8 @@ class Top2Vec:
         doc_top_tokens = dict()
         doc_top_token_dists = dict()  # New dictionary to store scores instead of indices
         doc_topic_distribution = np.zeros((self.num_documents, len(topic_vectors)))
+
+        print(doc_topic_distribution.shape) 
         doc_topic_scores = np.zeros((self.num_documents, len(topic_vectors)))
 
         # Convert document labels to numpy array for fast indexing
@@ -1126,18 +1131,18 @@ class Top2Vec:
                 doc_top.append(ids[0][0])
                 doc_dist.append(1 - scores[0][0])
         else:
-            batch_size = 10000
+            batch_size = 1000
             doc_top = []
             if dist:
                 doc_dist = []
 
-            if document_vectors.shape[0] > batch_size:
+            if len(document_vectors) > batch_size:
                 current = 0
-                batches = int(document_vectors.shape[0] / batch_size)
-                extra = document_vectors.shape[0] % batch_size
+                batches = int(len(document_vectors) / batch_size)
+                extra = len(document_vectors) % batch_size
 
                 for ind in range(0, batches):
-                    res = np.inner(document_vectors[current:current + batch_size], topic_vectors)
+                    res = np.inner(np.vstack(document_vectors[current:current + batch_size]), topic_vectors)
 
                     if num_topics is None:
                         doc_top.extend(np.argmax(res, axis=1))
@@ -1151,7 +1156,7 @@ class Top2Vec:
                     current += batch_size
 
                 if extra > 0:
-                    res = np.inner(document_vectors[current:current + extra], topic_vectors)
+                    res = np.inner(np.vstack(document_vectors[current:current + extra]), topic_vectors)
 
                     if num_topics is None:
                         doc_top.extend(np.argmax(res, axis=1))
@@ -1164,7 +1169,7 @@ class Top2Vec:
                 if dist:
                     doc_dist = np.array(doc_dist)
             else:
-                res = np.inner(document_vectors, topic_vectors)
+                res = np.inner(np.vstack(document_vectors), topic_vectors)
 
                 if num_topics is None:
                     doc_top = np.argmax(res, axis=1)
@@ -1274,6 +1279,15 @@ class Top2Vec:
         return combined_vector
 
     @staticmethod
+    def _search_vectors_by_vectors(vectors, vector, num_res):
+        ranks = np.inner(vector, vectors)
+        indexes = np.argsort(-ranks, axis=1)[:,:num_res]
+        scores = np.take_along_axis(ranks,indexes,axis=1)
+
+        return indexes, scores
+
+
+    @staticmethod
     def _search_vectors_by_vector(vectors, vector, num_res):
         ranks = np.inner(vectors, vector)
         indexes = np.flip(np.argsort(ranks)[-num_res:])
@@ -1311,6 +1325,9 @@ class Top2Vec:
                                   "Alternatively try: pip install torch sentence_transformers")
 
     def _check_model_status(self):
+        if not hasattr(self, 'embed'):
+            self.embed = None 
+
         if self.embed is None:
             if self.verbose is False:
                 logger.setLevel(logging.DEBUG)
@@ -1578,6 +1595,8 @@ class Top2Vec:
         # find topic words and scores
         self.topic_words, self.topic_word_scores = self._find_topic_words_and_scores(topic_vectors=self.topic_vectors)
 
+        print("topic vectors:", self.topic_vectors.shape)  
+
         if index_topics:
             self.index_topic_vectors()
             topic_index = self.topic_index
@@ -1598,12 +1617,15 @@ class Top2Vec:
         self.topic_word_scores_reduced = None
         self.hierarchy = None
 
-        if self.contextual_top2vec & contextual_top2vec:
+        if self.contextual_top2vec & contextual_top2vec and self.keep_documents:
 
             # smooth document token embeddings
-            document_token_embeddings = smooth_document_token_embeddings(self.document_token_embeddings,
+            document_token_embeddings = self.document_token_embeddings
+            smooth_document_token_embeddings(self.document_token_embeddings,
                                                                          window_size=c_top2vec_smoothing_window)
-            document_token_embeddings = normalize(np.vstack(document_token_embeddings))
+            
+            for k in range(len(document_token_embeddings)):
+                document_token_embeddings[k] = normalize(document_token_embeddings[k],copy=False)
 
             # create topic segments
             doc_top_tokens, doc_topic_distribution, doc_topic_scores, doc_top_token_dists, topic_sizes = self.calculate_documents_topic_distributions(
@@ -2389,14 +2411,15 @@ class Top2Vec:
         if self.contextual_top2vec:
 
             # smooth document token embeddings
-            document_token_embeddings = smooth_document_token_embeddings(self.document_token_embeddings,
+            smooth_document_token_embeddings(self.document_token_embeddings,
                                                                          window_size=self.c_top2vec_smoothing_window)
-            document_token_embeddings = normalize(np.vstack(document_token_embeddings))
+            for k in range(len(self.document_token_embeddings)):
+                self.document_token_embeddings[k] = normalize(self.document_token_embeddings[k], copy=False)
 
             # create topic segments
             doc_top_tokens, doc_topic_distribution, doc_topic_scores, doc_top_token_dists, topic_sizes = self.calculate_documents_topic_distributions(
                 topic_vectors=self.topic_vectors_reduced,
-                stacked_document_embeddings=document_token_embeddings,
+                stacked_document_embeddings=self.document_token_embeddings,
                 document_labels=self.document_labels)
 
             self.doc_top_tokens_reduced = doc_top_tokens
@@ -2711,6 +2734,19 @@ class Top2Vec:
         words = np.array([self.vocab[index] for index in word_indexes])
 
         return words, word_scores
+
+    def search_topics_by_vectors(self, vector, num_topics, reduced=False):
+        vector = self._l2_normalize(vector)
+
+        if reduced:
+
+            topic_nums, topic_scores = self._search_vectors_by_vectors(self.topic_vectors_reduced,
+                                                                      vector, num_topics)
+        else:
+            pass
+            #not implemented   
+        return topic_scores, topic_nums
+
 
     def search_topics_by_vector(self, vector, num_topics, reduced=False):
         """
